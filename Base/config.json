@@ -1,0 +1,12 @@
+{
+  "poles": 4,
+  "wheel_rpm_const": 23.65,
+  "use_filtered_on": false,
+  "plot_window_time": 10,
+  "max_erpm": 150000,
+  "error_threshold": 1000,
+  "vese_frequency": 50,
+  "kalman_frequency": 20,
+  "pid_frequency": 50,
+  "ramp_time_s": 0.2
+}
