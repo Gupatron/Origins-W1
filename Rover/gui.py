@@ -3,7 +3,7 @@ import time
 
 from PyQt6.QtWidgets import (
     QMainWindow, QVBoxLayout, QLabel, QLineEdit, QPushButton,
-    QFileDialog, QSlider, QWidget, QHBoxLayout
+    QFileDialog, QSlider, QWidget, QHBoxLayout, QCheckBox
 )
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QIntValidator, QKeyEvent
@@ -18,12 +18,18 @@ config = json.load(open('config.json'))
 
 SERVO_MIN = 50
 SERVO_MAX = 130
-MAX_RPM = 2000
-ACCEL_DELTA = 100  # RPM increase/decrease per update (50ms)
-FRICTION_DELTA = 50  # RPM decrease towards 0 per update
-STEER_DELTA = 2  # Angle change per update
-RETURN_DELTA = 5  # Angle return to center per update
-CONTROL_INTERVAL = 50  # ms
+MAX_RPM = 200
+# NEW: Load max bypass duty from config for safety
+MAX_BYPASS_DUTY = config.get('max_bypass_duty_percent', 20)
+
+# MODIFIED: Decoupled acceleration rates for PID and Bypass modes.
+RPM_ACCEL_DELTA = 10      # RPM increase/decrease per update (for PID mode)
+DUTY_ACCEL_DELTA = 0.1     # Duty Cycle % increase/decrease per update (for Bypass mode)
+FRICTION_DELTA = 5        # Natural deceleration per update
+BRAKE_DELTA = 20          # Active braking deceleration per update
+STEER_DELTA = 5           # Angle change per update
+RETURN_DELTA = 1          # Angle return to center per update
+CONTROL_INTERVAL = 20     # ms
 
 class PlotWindow(QDialog):
     def __init__(self, title, buffer, plot_type):
@@ -81,10 +87,14 @@ class GUI(QMainWindow):
         self.s_pressed = False
         self.a_pressed = False
         self.d_pressed = False
+        self.space_pressed = False
+        self.is_pid_bypassed = False
+
         central_widget = QWidget()
         layout = QVBoxLayout()
 
-        # ===================== PID config =====================
+        # PID config
+        pid_layout = QHBoxLayout()
         kp_label = QLabel('Kp:')
         self.kp_edit = QLineEdit()
         self.kp_edit.returnPressed.connect(self.update_pid)
@@ -94,9 +104,12 @@ class GUI(QMainWindow):
         kd_label = QLabel('Kd:')
         self.kd_edit = QLineEdit()
         self.kd_edit.returnPressed.connect(self.update_pid)
+        pid_layout.addWidget(kp_label); pid_layout.addWidget(self.kp_edit)
+        pid_layout.addWidget(ki_label); pid_layout.addWidget(self.ki_edit)
+        pid_layout.addWidget(kd_label); pid_layout.addWidget(self.kd_edit)
 
-        # ===================== Desired throttle =====================
-        desired_label = QLabel('Desired RPM:')
+        # Desired throttle
+        self.desired_label = QLabel('Desired RPM:')
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(-MAX_RPM, MAX_RPM)
         self.slider.valueChanged.connect(self.update_desired)
@@ -104,16 +117,19 @@ class GUI(QMainWindow):
         self.desired_edit.setValidator(QIntValidator(-MAX_RPM, MAX_RPM))
         self.desired_edit.returnPressed.connect(self.update_slider)
 
+        # PID Bypass Checkbox
+        self.pid_bypass_checkbox = QCheckBox("Bypass PID Controller (Direct Duty Cycle Control)")
+        self.pid_bypass_checkbox.stateChanged.connect(self.toggle_pid_bypass)
+
         # Omega s + duty displays
         self.omega_s_label = QLabel('Omega S: 0')
         self.duty_label = QLabel('Duty: 0')
 
-        # ===================== Servo controls (NEW) =====================
+        # Servo controls
         servo_header = QLabel('Servo Angle (50–130°):')
         self.servo_edit = QLineEdit('90')
         self.servo_edit.setValidator(QIntValidator(SERVO_MIN, SERVO_MAX))
         self.servo_edit.returnPressed.connect(self.publish_servo_angle)
-
         servo_row = QHBoxLayout()
         servo_set_btn = QPushButton('Set Servo')
         servo_set_btn.clicked.connect(self.publish_servo_angle)
@@ -121,231 +137,209 @@ class GUI(QMainWindow):
         servo_left_btn.clicked.connect(lambda: self.jog_servo(-1))
         servo_right_btn = QPushButton('Right ▶')
         servo_right_btn.clicked.connect(lambda: self.jog_servo(+1))
-
         servo_row.addWidget(self.servo_edit)
         servo_row.addWidget(servo_set_btn)
         servo_row.addWidget(servo_left_btn)
         servo_row.addWidget(servo_right_btn)
 
         # Save/load
+        save_load_layout = QHBoxLayout()
         save_btn = QPushButton('Save Gains')
         save_btn.clicked.connect(self.save_gains)
         load_btn = QPushButton('Load Gains')
         load_btn.clicked.connect(self.load_gains)
+        save_load_layout.addWidget(save_btn)
+        save_load_layout.addWidget(load_btn)
 
-        # Run/stop/timed
+        # Run controls
+        run_layout = QHBoxLayout()
         run_btn = QPushButton('Run Motor')
         run_btn.clicked.connect(self.run_motor)
         stop_btn = QPushButton('Stop Motor')
         stop_btn.clicked.connect(self.stop_motor)
-        time_label = QLabel('Run Time (s):')
-        self.time_edit = QLineEdit('20')
-        timed_btn = QPushButton('Run for Time')
-        timed_btn.clicked.connect(self.timed_run)
+        self.time_edit = QLineEdit('0.0')
+        timed_run_btn = QPushButton('Timed Run (s)')
+        timed_run_btn.clicked.connect(self.timed_run)
+        run_layout.addWidget(run_btn)
+        run_layout.addWidget(stop_btn)
+        run_layout.addWidget(self.time_edit)
+        run_layout.addWidget(timed_run_btn)
 
         # Plots
-        error_plot_btn = QPushButton('Error Plot')
-        error_plot_btn.clicked.connect(lambda: self.open_plot('error'))
-        rpm_plot_btn = QPushButton('RPM Plot')
+        plot_layout = QHBoxLayout()
+        rpm_plot_btn = QPushButton('Plot RPM')
         rpm_plot_btn.clicked.connect(lambda: self.open_plot('rpm'))
-        duty_plot_btn = QPushButton('Duty Plot')
+        error_plot_btn = QPushButton('Plot Error')
+        error_plot_btn.clicked.connect(lambda: self.open_plot('error'))
+        duty_plot_btn = QPushButton('Plot Duty')
         duty_plot_btn.clicked.connect(lambda: self.open_plot('duty'))
+        plot_layout.addWidget(rpm_plot_btn)
+        plot_layout.addWidget(error_plot_btn)
+        plot_layout.addWidget(duty_plot_btn)
 
-        # ===== Layout pack =====
-        layout.addWidget(kp_label); layout.addWidget(self.kp_edit)
-        layout.addWidget(ki_label); layout.addWidget(self.ki_edit)
-        layout.addWidget(kd_label); layout.addWidget(self.kd_edit)
-
-        layout.addWidget(desired_label)
+        # Assemble layout
+        layout.addLayout(pid_layout)
+        layout.addWidget(self.desired_label)
         layout.addWidget(self.slider)
         layout.addWidget(self.desired_edit)
-
-        # Servo UI
-        layout.addWidget(servo_header)
-        container = QWidget(); container.setLayout(servo_row)
-        layout.addWidget(container)
-
+        layout.addWidget(self.pid_bypass_checkbox)
         layout.addWidget(self.omega_s_label)
         layout.addWidget(self.duty_label)
-        layout.addWidget(save_btn); layout.addWidget(load_btn)
-        layout.addWidget(run_btn); layout.addWidget(stop_btn)
-        layout.addWidget(time_label); layout.addWidget(self.time_edit); layout.addWidget(timed_btn)
-        layout.addWidget(error_plot_btn); layout.addWidget(rpm_plot_btn); layout.addWidget(duty_plot_btn)
+        layout.addWidget(servo_header)
+        layout.addLayout(servo_row)
+        layout.addLayout(save_load_layout)
+        layout.addLayout(run_layout)
+        layout.addLayout(plot_layout)
 
         central_widget.setLayout(layout)
         self.setCentralWidget(central_widget)
 
-        # Update timer
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.update_displays)
-        self.timer.start(100)
-
-        # Control timer for wasd
+        # Timers
         self.control_timer = QTimer()
-        self.control_timer.timeout.connect(self.update_controls)
+        self.control_timer.timeout.connect(self.handle_keyboard_controls)
         self.control_timer.start(CONTROL_INTERVAL)
 
-        # Load default gains into GUI
-        try:
-            with open('gain_default.json') as f:
-                gains = json.load(f)
-                self.kp_edit.setText(str(gains['kp']))
-                self.ki_edit.setText(str(gains['ki']))
-                self.kd_edit.setText(str(gains['kd']))
-        except FileNotFoundError:
-            print("Default gains file not found")
+        self.display_timer = QTimer()
+        self.display_timer.timeout.connect(self.update_displays)
+        self.display_timer.start(100)
 
-    # ------------ Keyboard handling ------------
-
-    def keyPressEvent(self, e: QKeyEvent):
-        if e.key() == Qt.Key.Key_W:
-            self.w_pressed = True
-        elif e.key() == Qt.Key.Key_S:
-            self.s_pressed = True
-        elif e.key() == Qt.Key.Key_A:
-            self.a_pressed = True
-        elif e.key() == Qt.Key.Key_D:
-            self.d_pressed = True
-        elif e.key() == Qt.Key.Key_Left:
-            self.jog_servo(-1)
-        elif e.key() == Qt.Key.Key_Right:
-            self.jog_servo(+1)
-        else:
-            super().keyPressEvent(e)
-
-    def keyReleaseEvent(self, e: QKeyEvent):
-        if e.key() == Qt.Key.Key_W:
-            self.w_pressed = False
-        elif e.key() == Qt.Key.Key_S:
-            self.s_pressed = False
-        elif e.key() == Qt.Key.Key_A:
-            self.a_pressed = False
-        elif e.key() == Qt.Key.Key_D:
-            self.d_pressed = False
-        else:
-            super().keyReleaseEvent(e)
-
-    # ------------ Update controls from keys ------------
-
-    def update_controls(self):
+        # Load initial PID
         with self.buffer.lock:
-            current_speed = self.buffer.omega_d
+            self.kp_edit.setText(str(self.buffer.kp))
+            self.ki_edit.setText(str(self.buffer.ki))
+            self.kd_edit.setText(str(self.buffer.kd))
+
+    def keyPressEvent(self, event: QKeyEvent):
+        if event.key() == Qt.Key.Key_W: self.w_pressed = True
+        elif event.key() == Qt.Key.Key_S: self.s_pressed = True
+        elif event.key() == Qt.Key.Key_A: self.a_pressed = True
+        elif event.key() == Qt.Key.Key_D: self.d_pressed = True
+        elif event.key() == Qt.Key.Key_Space: self.space_pressed = True
+
+    def keyReleaseEvent(self, event: QKeyEvent):
+        if event.key() == Qt.Key.Key_W: self.w_pressed = False
+        elif event.key() == Qt.Key.Key_S: self.s_pressed = False
+        elif event.key() == Qt.Key.Key_A: self.a_pressed = False
+        elif event.key() == Qt.Key.Key_D: self.d_pressed = False
+        elif event.key() == Qt.Key.Key_Space: self.space_pressed = False
+
+    def handle_keyboard_controls(self):
+        with self.buffer.lock:
+            current_val = self.buffer.omega_d
             current_angle = self.buffer.servo_angle
 
-        speed_changed = False
+        val_changed = False
         angle_changed = False
 
-        # Handle speed
-        delta_speed = 0
-        if self.w_pressed:
-            delta_speed += ACCEL_DELTA
-        if self.s_pressed:
-            delta_speed -= ACCEL_DELTA
-
-        new_speed = current_speed
-        if self.w_pressed or self.s_pressed:
-            new_speed += delta_speed
+        # Handle throttle
+        delta_val = 0
+        if self.is_pid_bypassed:
+            if self.w_pressed: delta_val += DUTY_ACCEL_DELTA
+            if self.s_pressed: delta_val -= DUTY_ACCEL_DELTA
         else:
-            # Decelerate to 0
-            if current_speed > 0:
-                new_speed = max(0, current_speed - FRICTION_DELTA)
-            elif current_speed < 0:
-                new_speed = min(0, current_speed + FRICTION_DELTA)
+            if self.w_pressed: delta_val += RPM_ACCEL_DELTA
+            if self.s_pressed: delta_val -= RPM_ACCEL_DELTA
 
-        new_speed = max(-MAX_RPM, min(MAX_RPM, new_speed))
+        new_val = current_val
+        if self.w_pressed or self.s_pressed:
+            new_val += delta_val
+        else:
+            if current_val > 0: new_val = max(0, current_val - FRICTION_DELTA)
+            elif current_val < 0: new_val = min(0, current_val + FRICTION_DELTA)
 
-        if new_speed != current_speed:
-            speed_changed = True
-            self.desired_edit.setText(str(int(new_speed)))
-            self.slider.setValue(int(new_speed))
-            with self.buffer.lock:
-                self.buffer.omega_d = new_speed
+        if self.space_pressed:
+            if new_val > 0: new_val = max(0, new_val - BRAKE_DELTA)
+            elif new_val < 0: new_val = min(0, new_val + BRAKE_DELTA)
+
+        if self.is_pid_bypassed:
+            new_val = max(-MAX_BYPASS_DUTY, min(MAX_BYPASS_DUTY, new_val))
+        else:
+            new_val = max(-MAX_RPM, min(MAX_RPM, new_val))
+
+        if new_val != current_val:
+            val_changed = True
+            self.desired_edit.blockSignals(True)
+            self.slider.blockSignals(True)
+            self.desired_edit.setText(str(int(new_val)))
+            self.slider.setValue(int(new_val))
+            self.desired_edit.blockSignals(False)
+            self.slider.blockSignals(False)
+            with self.buffer.lock: self.buffer.omega_d = new_val
 
         # Handle steering
         delta_angle = 0
-        if self.a_pressed:
-            delta_angle -= STEER_DELTA
-        if self.d_pressed:
-            delta_angle += STEER_DELTA
+        if self.a_pressed: delta_angle -= STEER_DELTA
+        if self.d_pressed: delta_angle += STEER_DELTA
 
         new_angle = current_angle
-        if self.a_pressed or self.d_pressed:
-            new_angle += delta_angle
+        if self.a_pressed or self.d_pressed: new_angle += delta_angle
         else:
-            # Return to center
-            if current_angle > 90:
-                new_angle = max(90, current_angle - RETURN_DELTA)
-            elif current_angle < 90:
-                new_angle = min(90, current_angle + RETURN_DELTA)
+            if current_angle > 90: new_angle = max(90, current_angle - RETURN_DELTA)
+            elif current_angle < 90: new_angle = min(90, current_angle + RETURN_DELTA)
 
         new_angle = max(SERVO_MIN, min(SERVO_MAX, new_angle))
 
         if new_angle != current_angle:
             angle_changed = True
             self.servo_edit.setText(str(int(new_angle)))
-            with self.buffer.lock:
-                self.buffer.servo_angle = new_angle
+            with self.buffer.lock: self.buffer.servo_angle = new_angle
 
-        # Publish if anything changed
-        if speed_changed or angle_changed:
-            msg = {
-                'kp': self.buffer.kp,
-                'ki': self.buffer.ki,
-                'kd': self.buffer.kd,
-                'omega_d': self.buffer.omega_d,
-                'running': self.buffer.running,
-                'timed_run': False,
-                'run_time': 0.0,
-                'servo_angle': self.buffer.servo_angle if angle_changed else None
-            }
-            # Remove None values
-            if msg['servo_angle'] is None:
-                del msg['servo_angle']
-            self.zenoh_session.put(COMMAND_KEY, json.dumps(msg))
+        if val_changed or angle_changed: self._publish_command()
+
+    def _publish_command(self, is_timed_run=False, run_time=0.0):
+        with self.buffer.lock:
+            kp, ki, kd = self.buffer.kp, self.buffer.ki, self.buffer.kd
+            omega_d = self.buffer.omega_d
+            running = self.buffer.running
+            servo_angle = self.buffer.servo_angle
+
+        msg = {
+            'kp': kp, 'ki': ki, 'kd': kd,
+            'running': running,
+            'timed_run': is_timed_run,
+            'run_time': run_time,
+            'servo_angle': servo_angle,
+            'bypass_pid': self.is_pid_bypassed
+        }
+        
+        if self.is_pid_bypassed:
+            msg['direct_duty'] = omega_d / 100.0
+            msg['omega_d'] = 0
+        else:
+            msg['omega_d'] = omega_d
+            msg['direct_duty'] = 0.0
+            
+        self.zenoh_session.put(COMMAND_KEY, json.dumps(msg))
 
     def publish_servo_angle(self):
         try:
             angle = int(self.servo_edit.text())
             angle = max(SERVO_MIN, min(SERVO_MAX, angle))
-            with self.buffer.lock:
-                self.buffer.servo_angle = angle
-            msg = {
-                'kp': self.buffer.kp,
-                'ki': self.buffer.ki,
-                'kd': self.buffer.kd,
-                'omega_d': self.buffer.omega_d,
-                'running': self.buffer.running,
-                'timed_run': False,
-                'run_time': 0.0,
-                'servo_angle': angle
-            }
-            self.zenoh_session.put(COMMAND_KEY, json.dumps(msg))
-        except ValueError:
-            pass
+            with self.buffer.lock: self.buffer.servo_angle = angle
+            self._publish_command()
+        except ValueError: pass
 
     def jog_servo(self, delta):
-        # Send a small relative change; rover will apply and clamp.
-        msg = {
-            'kp': self.buffer.kp,
-            'ki': self.buffer.ki,
-            'kd': self.buffer.kd,
-            'omega_d': self.buffer.omega_d,
-            'running': self.buffer.running,
-            'timed_run': False,
-            'run_time': 0.0,
-            'servo_jog': int(delta)
-        }
-        self.zenoh_session.put(COMMAND_KEY, json.dumps(msg))
-
-        # Also update local display optimistically
         try:
             cur = int(self.servo_edit.text())
-        except Exception:
-            cur = 90
+        except Exception: cur = 90
         cur = max(SERVO_MIN, min(SERVO_MAX, cur + int(delta)))
         self.servo_edit.setText(str(cur))
+        with self.buffer.lock: self.buffer.servo_angle = cur
+        self._publish_command()
 
-    # ------------ Existing motor GUI code ------------
+    def toggle_pid_bypass(self, state):
+        self.is_pid_bypassed = (state == Qt.CheckState.Checked.value)
+        self.slider.setValue(0)
+        if self.is_pid_bypassed:
+            self.desired_label.setText("Desired Duty Cycle (%):")
+            self.slider.setRange(-MAX_BYPASS_DUTY, MAX_BYPASS_DUTY)  # NEW: Limit range for safety
+            self.desired_edit.setValidator(QIntValidator(-MAX_BYPASS_DUTY, MAX_BYPASS_DUTY))  # NEW: Limit validator
+        else:
+            self.desired_label.setText("Desired RPM:")
+            self.slider.setRange(-MAX_RPM, MAX_RPM)
+            self.desired_edit.setValidator(QIntValidator(-MAX_RPM, MAX_RPM))
+        self.update_slider()
 
     def update_pid(self):
         try:
@@ -353,52 +347,21 @@ class GUI(QMainWindow):
                 self.buffer.kp = float(self.kp_edit.text())
                 self.buffer.ki = float(self.ki_edit.text())
                 self.buffer.kd = float(self.kd_edit.text())
-            msg = {
-                'kp': self.buffer.kp,
-                'ki': self.buffer.ki,
-                'kd': self.buffer.kd,
-                'omega_d': self.buffer.omega_d,
-                'running': self.buffer.running,
-                'timed_run': False,
-                'run_time': 0.0
-            }
-            self.zenoh_session.put(COMMAND_KEY, json.dumps(msg))
-        except ValueError:
-            print("Invalid PID values entered")
+            self._publish_command()
+        except ValueError: print("Invalid PID values entered")
 
     def update_desired(self, value):
         self.desired_edit.setText(str(value))
-        with self.buffer.lock:
-            self.buffer.omega_d = float(value)
-        msg = {
-            'kp': self.buffer.kp,
-            'ki': self.buffer.ki,
-            'kd': self.buffer.kd,
-            'omega_d': self.buffer.omega_d,
-            'running': self.buffer.running,
-            'timed_run': False,
-            'run_time': 0.0
-        }
-        self.zenoh_session.put(COMMAND_KEY, json.dumps(msg))
+        with self.buffer.lock: self.buffer.omega_d = float(value)
+        self._publish_command()
 
     def update_slider(self):
         try:
             value = int(self.desired_edit.text())
             self.slider.setValue(value)
-            with self.buffer.lock:
-                self.buffer.omega_d = float(value)
-            msg = {
-                'kp': self.buffer.kp,
-                'ki': self.buffer.ki,
-                'kd': self.buffer.kd,
-                'omega_d': self.buffer.omega_d,
-                'running': self.buffer.running,
-                'timed_run': False,
-                'run_time': 0.0
-            }
-            self.zenoh_session.put(COMMAND_KEY, json.dumps(msg))
-        except ValueError:
-            pass
+            with self.buffer.lock: self.buffer.omega_d = float(value)
+            self._publish_command()
+        except ValueError: pass
 
     def update_displays(self):
         with self.buffer.lock:
@@ -409,15 +372,9 @@ class GUI(QMainWindow):
         try:
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             filename = f'gain_{timestamp}.json'
-            gains = {
-                'kp': float(self.kp_edit.text()),
-                'ki': float(self.ki_edit.text()),
-                'kd': float(self.kd_edit.text())
-            }
-            with open(filename, 'w') as f:
-                json.dump(gains, f)
-        except ValueError:
-            print("Invalid values for saving gains")
+            gains = { 'kp': float(self.kp_edit.text()), 'ki': float(self.ki_edit.text()), 'kd': float(self.kd_edit.text()) }
+            with open(filename, 'w') as f: json.dump(gains, f)
+        except ValueError: print("Invalid values for saving gains")
 
     def load_gains(self):
         filename, _ = QFileDialog.getOpenFileName(self, 'Load Gains', '', 'JSON (*.json)')
@@ -429,56 +386,23 @@ class GUI(QMainWindow):
                     self.ki_edit.setText(str(gains['ki']))
                     self.kd_edit.setText(str(gains['kd']))
                     self.update_pid()
-            except Exception as e:
-                print(f"Error loading gains: {e}")
+            except Exception as e: print(f"Error loading gains: {e}")
 
     def run_motor(self):
-        with self.buffer.lock:
-            self.buffer.running = True
-        msg = {
-            'kp': self.buffer.kp,
-            'ki': self.buffer.ki,
-            'kd': self.buffer.kd,
-            'omega_d': self.buffer.omega_d,
-            'running': True,
-            'timed_run': False,
-            'run_time': 0.0
-        }
-        self.zenoh_session.put(COMMAND_KEY, json.dumps(msg))
+        with self.buffer.lock: self.buffer.running = True
+        self._publish_command()
 
     def stop_motor(self):
-        with self.buffer.lock:
-            self.buffer.running = False
-        msg = {
-            'kp': self.buffer.kp,
-            'ki': self.buffer.ki,
-            'kd': self.buffer.kd,
-            'omega_d': self.buffer.omega_d,
-            'running': False,
-            'timed_run': False,
-            'run_time': 0.0
-        }
-        self.zenoh_session.put(COMMAND_KEY, json.dumps(msg))
+        with self.buffer.lock: self.buffer.running = False
+        self._publish_command()
 
     def timed_run(self):
         try:
             run_time = float(self.time_edit.text())
             if run_time > 0:
-                with self.buffer.lock:
-                    self.buffer.running = True
-                msg = {
-                    'kp': self.buffer.kp,
-                    'ki': self.buffer.ki,
-                    'kd': self.buffer.kd,
-                    'omega_d': self.buffer.omega_d,
-                    'running': True,
-                    'timed_run': True,
-                    'run_time': run_time
-                }
-                self.zenoh_session.put(COMMAND_KEY, json.dumps(msg))
-                QTimer.singleShot(int(run_time * 1000), self.stop_motor)
-        except ValueError:
-            print("Invalid run time entered")
+                with self.buffer.lock: self.buffer.running = True
+                self._publish_command(is_timed_run=True, run_time=run_time)
+        except ValueError: print("Invalid run time entered")
 
     def open_plot(self, plot_type):
         window = PlotWindow(f'{plot_type.capitalize()} Plot', self.buffer, plot_type)
