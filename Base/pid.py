@@ -30,17 +30,19 @@ def pid_thread(buffer, stop_event):
                 pid.kp = buffer.kp
                 pid.ki = buffer.ki
                 pid.kd = buffer.kd
-                if buffer.bypass_pid:  # NEW: Check for bypass mode
+                if buffer.bypass_pid:
                     buffer.u_duty = buffer.direct_duty
                     buffer.error = 0.0
-                    # NEW: Reset PID state to avoid jumps when switching back to PID mode
                     pid.integral = 0.0
                     pid.prev_error = 0.0
-                else:  # Normal PID mode
+                else:
                     current = buffer.omega_filteredrpm if buffer.use_filtered_on else buffer.omega_rpm
                     u, error = pid.compute(buffer.omega_d, current)
                     if abs(error) > config['error_threshold']:
                         u = 0.0
+                    min_duty = config.get('min_duty', 0.05)
+                    if abs(u) > 0 and abs(u) < min_duty:
+                        u = min_duty * np.sign(u)
                     u = np.clip(u, -1.0, 1.0)
                     buffer.u_duty = u
                     buffer.error = error

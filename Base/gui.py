@@ -26,12 +26,15 @@ except:
 SERVO_MIN = 50
 SERVO_MAX = 130
 MAX_RPM = 200
+
+MIN_START_DUTY_PERCENT = 2  # Adjust this if the minimum duty to start moving is different from 2%
+TRIGGER_MAX = 0.8  # Change this to the R2 value you see when fully pressing the trigger
 # CHANGED: Max duty in bypass mode = 15%
-MAX_BYPASS_DUTY = config.get('max_bypass_duty_percent', 15)  # DEFAULT 15
+MAX_BYPASS_DUTY = config.get('max_bypass_duty_percent', 20)  # DEFAULT 15
 
 # Acceleration / deceleration constants
 RPM_ACCEL_DELTA   = 10      # per update in PID mode
-DUTY_ACCEL_DELTA  = 8       # per update in Bypass mode
+DUTY_ACCEL_DELTA  = 8    # per update in Bypass mode
 FRICTION_DELTA    = 5
 BRAKE_DELTA       = 20
 STEER_DELTA       = 5
@@ -191,6 +194,10 @@ class GUI(QMainWindow):
         self.joystick_worker = JoystickWorker()
         self.joystick_thread = None
         self.controller_widget = ControllerWidget()
+
+        # Smoothing for controller inputs
+        self.last_throttle = 0.0
+        self.last_steer = 0.0
 
         # UI
         central = QWidget()
@@ -364,8 +371,12 @@ class GUI(QMainWindow):
             lx = self.controller_widget.left_x
             r2 = self.controller_widget.r2
             l2 = self.controller_widget.l2
-            throttle_input = r2 - l2
-            steer_input = lx
+            raw_throttle = r2 - l2
+            throttle_input = 0.8 * self.last_throttle + 0.2 * raw_throttle
+            self.last_throttle = throttle_input
+            raw_steer = lx
+            steer_input = 0.8 * self.last_steer + 0.2 * raw_steer
+            self.last_steer = steer_input
         else:
             if self.w_pressed: throttle_input += 1.0
             if self.s_pressed: throttle_input -= 1.0
@@ -373,18 +384,29 @@ class GUI(QMainWindow):
             if self.d_pressed: steer_input += 1.0
             brake = self.space_pressed
 
-            if abs(throttle_input) < 0.01: throttle_input = 0.0   # Lower dead-zone
-            if abs(steer_input) < 0.05: steer_input = 0.0        # Lower for steering
+        # Apply dead-zones regardless of input method
+        if abs(throttle_input) < 0.01:
+            throttle_input = 0.0  # Lower dead-zone for throttle
+        if abs(steer_input) < 0.05:
+            steer_input = 0.0  # Lower dead-zone for steering
 
         # Throttle
-        delta_val = throttle_input * accel_step
-        new_val = cur_val + delta_val
+        max_val = MAX_BYPASS_DUTY if self.is_pid_bypassed else MAX_RPM
+        min_start = MIN_START_DUTY_PERCENT if self.is_pid_bypassed else 0
 
-        if throttle_input == 0:
+        if throttle_input != 0:
+            abs_throttle = abs(throttle_input)
+            sign = 1 if throttle_input > 0 else -1
+            scaled_throttle = min(1.0, abs_throttle / TRIGGER_MAX)
+            target = min_start + (max_val - min_start) * scaled_throttle
+            new_val = sign * target
+        else:
             if cur_val > 0:
                 new_val = max(0, cur_val - FRICTION_DELTA)
             elif cur_val < 0:
                 new_val = min(0, cur_val + FRICTION_DELTA)
+            else:
+                new_val = 0
 
         if brake:
             if new_val > 0:
@@ -393,10 +415,7 @@ class GUI(QMainWindow):
                 new_val = min(0, new_val + BRAKE_DELTA)
 
         # Clamp
-        if self.is_pid_bypassed:
-            new_val = max(-MAX_BYPASS_DUTY, min(MAX_BYPASS_DUTY, new_val))
-        else:
-            new_val = max(-MAX_RPM, min(MAX_RPM, new_val))
+        new_val = max(-max_val, min(max_val, new_val))
 
         if new_val != cur_val:
             val_changed = True
@@ -427,8 +446,7 @@ class GUI(QMainWindow):
             with self.buffer.lock:
                 self.buffer.servo_angle = new_angle
 
-        if val_changed or angle_changed:
-            self._publish_command()
+        self._publish_command()
 
     # --- Publish ---
     def _publish_command(self, is_timed_run=False, run_time=0.0):

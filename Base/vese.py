@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import time
-import numpy as np
 import glob
 import serial
 import threading
@@ -16,11 +15,10 @@ def _crc16_xmodem(data: bytes) -> int:
     for b in data:
         crc ^= (b << 8)
         for _ in range(8):
-            if (crc & 0x8000) != 0:
-                crc = (crc << 1) ^ 0x1021
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
             else:
-                crc <<= 1
-            crc &= 0xFFFF
+                crc = (crc << 1) & 0xFFFF
     return crc
 
 def pack_comm(payload: bytes) -> bytes:
@@ -45,7 +43,7 @@ def ramp_duty(ser, start, stop, ramp_time):
     for i in range(steps + 1):
         val = start + (stop - start) * (i / steps)
         try:
-            ser.write(encode(SetDutyCycle(int(float(np.clip(val, -1.0, 1.0)) * 100000))))
+            ser.write(encode(SetDutyCycle(int(val * 100000))))
             ser.flush()
             time.sleep(0.05)
         except serial.SerialException as e:
@@ -59,48 +57,26 @@ def vese_thread(buffer, stop_event):
         with serial.Serial(port, BAUD, timeout=0.2) as ser:  # Increased timeout
             last_running = False
             last_duty = 0.0
-
             while not stop_event.is_set():
                 with buffer.lock:
                     running = buffer.running
-                    duty = float(np.clip(buffer.u_duty, -1.0, 1.0))  # hard clamp
-
-                # Optional soft-start/stop on transitions
+                    duty = buffer.u_duty if running else 0.0
                 if running and not last_running:
-                    # ramp from last to current over configured time
-                    ramp_time_s = config.get('duty_ramp_time_s', 0.0)
-                    if ramp_time_s > 0:
-                        ramp_duty(ser, last_duty, duty, ramp_time_s)
-                    else:
-                        try:
-                            ser.write(encode(SetDutyCycle(int(float(np.clip(duty, -1.0, 1.0)) * 100000))))
-                            ser.flush()
-                        except serial.SerialException as e:
-                            print(f"Serial error: {e}")
+                    ramp_duty(ser, last_duty, duty, config['ramp_time_s'])
                 elif not running and last_running:
-                    # on stop, ramp to zero if configured
-                    ramp_time_s = config.get('stop_ramp_time_s', 0.0)
-                    if ramp_time_s > 0:
-                        ramp_duty(ser, last_duty, 0.0, ramp_time_s)
-                    else:
-                        try:
-                            ser.write(encode(SetDutyCycle(0)))
-                            ser.flush()
-                        except serial.SerialException as e:
-                            print(f"Serial error: {e}")
+                    ramp_duty(ser, last_duty, 0.0, config['ramp_time_s'])
                 else:
-                    # steady state
                     try:
-                        ser.write(encode(SetDutyCycle(int(float(np.clip(duty, -1.0, 1.0)) * 100000))))
+                        ser.write(encode(SetDutyCycle(int(duty * 100000))))
                         ser.flush()
                     except serial.SerialException as e:
                         print(f"Serial error: {e}")
-
-                # Read a telemetry frame (example parsing—as in your original)
+                ser.reset_input_buffer()
                 try:
-                    ser.write(pack_comm(b'\x04'))  # hypothetical "get values" cmd
-                    time.sleep(0.01)               # small delay
-                    buf = ser.read(128)            # read some bytes
+                    ser.write(pack_comm(b"\x04"))
+                    ser.flush()
+                    time.sleep(0.1)  # Increased sleep for better reliability
+                    buf = ser.read(512)
                     if buf and len(buf) >= 29:
                         rpm_bytes = buf[25:29]
                         omega_erpm = int.from_bytes(rpm_bytes, 'big', signed=True)
@@ -111,9 +87,8 @@ def vese_thread(buffer, stop_event):
                         print(f"No sufficient data received from VESC (len: {len(buf) if buf else 0})")
                 except serial.SerialException as e:
                     print(f"Serial read error: {e}")
-
                 last_running = running
                 last_duty = duty
-                time.sleep(dt)
+                time.sleep(max(0, dt - 0.1))
     except Exception as e:
         print(f"VESC thread error: {e}")

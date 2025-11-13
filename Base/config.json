@@ -6,6 +6,6 @@
 "plot_window_time": 10,
 "wheel_rpm_const": 7,
 "vese_frequency": 50,
-"ramp_time_s": 0.1,
-"max_bypass_duty_percent": 8
+"ramp_time_s": 0.3,
+"max_bypass_duty_percent": 10
 }
