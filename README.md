@@ -26,3 +26,6 @@ Be sure to connect the controller before running base.py.
 
 ## Video of the Rover Moving 
 
+https://github.com/user-attachments/assets/45c1cd4a-3046-4b23-9043-be98f1bed5d7
+
+
